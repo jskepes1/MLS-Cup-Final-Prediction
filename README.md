@@ -1,3 +1,10 @@
+# Methodology of the Analyses
+
+The methodology was primarily ran by Jacob Kepes, with some of the base code taken from online sources. Analyses were written in R Studio and Quarto.
+I created the columns of goals scored, goals against, goal differential, and the points at each month in the season. Because matchweeks and games don't always occur on the same day, I wanted to aggregate by month.
+The analyses were only based after 2020 because I wanted to capture a more recent period of time that captures how large the league has grown and the nunber of teams that have been added.
+I then ran a random forest model with 500 trees.
+
 # MLS Elo Ratings Dataset
 
 Historical and up-to-date Elo ratings for Major League Soccer (MLS), covering every regular-season and playoff match from the league's inaugural 1996 season to the present.
@@ -31,12 +38,3 @@ The model follows the standard Elo methodology used across most football Elo imp
 - **Two-legged playoff rounds (2003–2018)**: Some Conference Semifinals/Finals during this period were decided over two legs (aggregate score). For these ties, the two legs are combined into a single aggregate result and treated as one neutral-site match for Elo purposes, rather than as two separate updates.
 - **Extra time**: Some historical playoff matches may include extra-time scores. Going forward, updates will only use the regulation-time (90-minute) score.
 Data compiled from publicly available match results.
-
-
-
-#Methodology of the Analyses
-
-The methodology was primarily ran by Jacob Kepes, with some of the base code taken from online sources. Analyses were written in R Studio and Quarto.
-I created the columns of goals scored, goals against, goal differential, and the points at each month in the season. Because matchweeks and games don't always occur on the same day, I wanted to aggregate by month.
-The analyses were only based after 2020 because I wanted to capture a more recent period of time that captures how large the league has grown and the nunber of teams that have been added.
-I then ran a random forest model with 500 trees.
