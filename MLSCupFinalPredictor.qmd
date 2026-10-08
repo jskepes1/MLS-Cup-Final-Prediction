@@ -1,0 +1,528 @@
+---
+title: "Machine Learning of MLS Data"
+subtitle: "Machine Learning Workflow in R"
+format:
+  html:
+    toc: true
+    toc-title: "On deck"
+    toc-location: right
+    code-fold: false
+    code-copy: true
+    code-tools: false
+    embed-resources: true
+    theme: cosmo
+    css: styles.css
+    fig-align: center
+    fig-width: 8
+    fig-height: 5
+---
+
+## I. Can we predict who will make the MLS Cup Final? &#9917;
+
+Before an MLS season is over, can we predict which team(s) will make the final, using a random forest model?
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+library(tidymodels)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(ranger)
+library(knitr)
+
+set.seed(20261005) 
+```
+
+## 1. Load and Clean the data
+
+```{r}
+setwd("C:/Users/Jacob.Kepes/OneDrive - State of Illinois/MLS DS Project/")
+df <- read_csv("results.csv", show_col_types = FALSE)
+
+# Remove defunct teams
+defunct <- c("Tampa Bay Mutiny", "Chivas USA", "Miami Fusion FC")
+df <- df %>%
+  filter(!home_team %in% defunct) %>%
+  filter(!away_team %in% defunct)
+
+# Load date, keep seasons 2020+
+df <- df %>%
+  mutate(date = as.Date(date)) %>%
+  filter(date > "2020-01-01")
+
+# Identify the final game for each season (one row per year)
+all_finals <- df %>%
+  mutate(year = year(date)) %>%
+  group_by(year) %>%
+  slice_max(date, n = 1) %>%
+  ungroup() %>%
+  filter(date <= as.Date("2026-01-01")) %>%
+  mutate(finals = 1)
+
+# Create finalist lookup as list-column, safer for matching
+finals_lookup <- all_finals %>%
+  transmute(
+    year,
+    finals = map2(home_team, away_team, ~ c(.x, .y))
+  )
+
+# Add correct finalist flags to df
+df <- df %>%
+  mutate(year = year(date)) %>%
+  left_join(finals_lookup, by = "year") %>%
+  rowwise() %>%   # <-- important to evaluate per row
+  mutate(
+    home_made_finals = home_team %in% finals,
+    away_made_finals = away_team %in% finals
+  ) %>%
+  ungroup() %>%
+  select(-finals)
+
+# ------------------------------------------------------------------------------
+# MAKE TEAM-GAME LONG FORMAT
+# ------------------------------------------------------------------------------
+
+df_long <- df %>%
+  mutate(
+    month = floor_date(date, "month"),
+    year = year(date)
+  ) %>%
+  transmute(
+    date, month, year,
+    team_home = home_team,
+    team_away = away_team,
+    home_points = case_when(
+      home_score > away_score ~ 3,
+      home_score == away_score ~ 1,
+      TRUE ~ 0
+    ),
+    away_points = case_when(
+      away_score > home_score ~ 3,
+      away_score == home_score ~ 1,
+      TRUE ~ 0
+    ),
+    home_gf = home_score,
+    home_ga = away_score,
+    away_gf = away_score,
+    away_ga = home_score,
+    home_elo = home_elo_update,
+    away_elo = away_elo_update,
+    home_made_finals,
+    away_made_finals
+  ) %>%
+  pivot_longer(
+    cols = c(team_home, team_away),
+    names_to = "side",
+    values_to = "team"
+  ) %>%
+  mutate(
+    points = if_else(side == "team_home", home_points, away_points),
+    gf = if_else(side == "team_home", home_gf, away_gf),
+    ga = if_else(side == "team_home", home_ga, away_ga),
+    elo = if_else(side == "team_home", home_elo, away_elo),
+    made_finals = if_else(side == "team_home", home_made_finals, away_made_finals),
+
+    # win indicator
+    win = as.integer(gf > ga)
+  ) %>%
+  select(team, date, month, year, points, gf, ga, elo, win, made_finals)
+
+# ------------------------------------------------------------------------------
+# YEAR-RESETTING CUMULATIVE TOTALS
+# ------------------------------------------------------------------------------
+
+df_cumulative <- df_long %>%
+  arrange(team, date) %>%
+  group_by(team, year) %>%
+  mutate(
+    cum_points = cumsum(points),
+    cum_gf = cumsum(gf),
+    cum_ga = cumsum(ga),
+    cum_gd = cum_gf - cum_ga,
+    games_played = row_number(),
+    cum_wins = cumsum(win)
+  ) %>%
+  ungroup()
+
+# ------------------------------------------------------------------------------
+# MONTHLY STANDINGS 
+# ------------------------------------------------------------------------------
+
+monthly_standings <- df_cumulative %>%
+  group_by(team, year, month) %>%
+  summarise(
+    points = max(cum_points),
+    wins = max(cum_wins),
+    gf = max(cum_gf),
+    ga = max(cum_ga),
+    gd = max(cum_gd),
+    games_played = max(games_played),
+    latest_elo = elo[which.max(date)],
+
+    # IMPORTANT: A team is a finalist only if THEY were one of the finals teams
+    made_finals = any(made_finals == TRUE),
+
+    .groups = "drop"
+  ) %>%
+  arrange(year, month, desc(points), desc(gd), desc(gf), desc(wins))
+
+# Convert to Yes/No factor
+monthly_standings <- monthly_standings %>%
+  mutate(
+    made_finals = factor(
+      if_else(made_finals, "Yes", "No"),
+      levels = c("No", "Yes")
+    )
+  )
+```
+- **Training:** 2020–2024
+- **Testing:** 2025
+- **Current season:** 2026
+
+```{r}
+#| label: load-data
+
+train<-monthly_standings %>% filter(month > "2020-01-01" & month < "2024-12-31")
+test<-monthly_standings %>% filter(month > "2025-01-01" & month < "2025-12-31")
+current<-monthly_standings %>% filter(month > "2026-01-01" & month < "2026-12-31")
+```
+
+
+## 2. Take a look at the data
+
+
+```{r}
+#| label: inspect-data
+
+tibble(
+  Dataset = c("Training (2020–2024)", "Testing (2025)", "Current (2026)"),
+  Rows = c(nrow(train), nrow(test), nrow(current)),
+  `Team-seasons` = c(
+    n_distinct(train$team),
+    n_distinct(test$team),
+    n_distinct(current$team)
+  )
+) %>%
+  kable(align = "lrr")
+```
+
+Each row is a game.
+
+```{r}
+#| label: inspect-outcome
+
+train %>%
+  filter(made_finals == "Yes") %>%
+  group_by(team, year) %>%
+  count(made_finals, name = "Snapshots") %>%
+  kable(
+    align = "lr",
+    caption = "Training label balance"
+  )
+```
+
+Multiple teams have been added since 2020, including San Diego FC, Inter Miami FC, and LAFC.
+
+Here is a small snapshot of the modeling data.
+
+I've lived in a few metros with MLS teams over the years, so I root for the Chicago Fire, Atlanta United, and Columbus Crew! You can call me a fair weather fan, but I just love these fan bases and cities!
+
+
+```{r}
+#| label: data-snapshot
+
+train %>%
+  filter(
+    year == 2020,
+    team %in% c("Columbus Crew", "Chicago Fire FC", "Atlanta United FC")
+  ) %>%
+  arrange(month, team) %>%
+  transmute(
+    year = year,
+    team = team,
+    latest_elo = latest_elo,
+    made_finals = made_finals
+  ) %>%
+  kable(
+    align = "l",
+    caption = "Example rows from the training data",
+    table.attr = 'class="data-snapshot"'
+  )
+```
+
+## 3. Preprocess with a recipe
+
+Next we'll define the predictors and transformations using the **recipes** package. Some features are created inside the recipe so the same transformations are applied consistently to future data.
+
+<!-- A recipe is a reproducible set of instructions for preparing data for a model. Why not dplyr? Then you have to remember to perform exactly the same transformations on the test data and the 2026 data. With a recipe, those same steps are automatically applied to new data later. -->
+
+```{r}
+finals_recipe <- recipe(
+  made_finals ~
+    latest_elo +
+    points +
+    gf +
+    ga +
+    gd +
+    games_played +
+    wins, 
+  data = train
+) %>%
+  step_mutate(
+    points_per_game = points / games_played,
+    win_pct = wins / games_played,
+    goal_diff_per_game = gd / games_played
+  ) %>%
+  step_rm(points, wins, gd, games_played) %>%
+  step_zv(all_predictors())
+```
+
+
+## 4. Specify the model
+
+Now we'll tell tidymodels what kind of model we want to fit. This is the **parsnip** part of tidymodels — a single, consistent interface for describing models regardless of which engine ends up running them.
+
+```{r}
+rf_spec <- rand_forest(
+  trees = 500
+) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+```
+
+<!-- We're fitting a random forest with 500 trees, using ranger as the engine, and classification because our outcome is yes or no. The model specification describes what we want to fit, but it does not fit anything yet. -->
+
+
+## 5. Build the workflow
+
+A **workflows** object bundles the preprocessing steps and model specification together.
+
+```{r}
+finals_workflow <- workflow() %>%
+  add_recipe(finals_recipe) %>%
+  add_model(rf_spec)
+```
+
+<!-- This is the key tidymodels idea: preprocessing and modeling travel together. -->
+
+
+## 6. Fit the model
+
+Now we can fit the entire workflow to our historical training data.
+
+```{r}
+finals_fit <- finals_workflow %>%
+  fit(data = train)
+```
+
+
+## 7. Evaluate on 2025
+
+Now we'll test the fitted workflow on the held-out 2025 season.
+
+We'll make our prediction 60% of the way through the season — early enough that the playoff field isn't completely settled yet.
+
+```{r}
+#| label: evaluate-2025
+
+test_60 <- test %>%
+  filter(month == "2025-09-01")
+
+test_predictions <- predict(
+  finals_fit,
+  new_data = test_60,
+  type = "prob"
+) %>%
+  bind_cols(
+    predict(finals_fit, new_data = test_60)
+  ) %>%
+  bind_cols(
+    test_60 %>%
+      select(team, made_finals)
+  ) %>%
+  arrange(desc(.pred_Yes))
+```
+
+The **RF Finals score** shows how strongly the random forest leans toward a playoff outcome. The class prediction just applies a 50% cutoff to that score. So, only Miami had a 50% chance of making the finals that year.
+
+```{r}
+#| label: evaluate-2025-table
+
+test_predictions %>%
+  transmute(
+    Team = team,
+    Actual = made_finals,
+    Predicted = .pred_class,
+    `RF Finals score` = scales::percent(.pred_Yes, accuracy = 1)
+  ) %>%
+  kable(align = "lccr")
+```
+
+```{r}
+#| label: evaluate-2025-metrics
+
+accuracy(
+  test_predictions,
+  truth = made_finals,
+  estimate = .pred_class
+) %>%
+  transmute(Metric = .metric, Value = scales::percent(.estimate, accuracy = 1)) %>%
+  kable(align = "lr")
+
+conf_mat(
+  test_predictions,
+  truth = made_finals,
+  estimate = .pred_class
+)
+```
+
+Our model says it has **97%** accuracy.  This is jjust one moment in the season, but we did predict that Inter Miami would make it to the final, and it was the clear choice.
+
+## 8. Refit with all historical data
+
+We held out 2025 so we could evaluate our model on data it had never seen.
+
+Now that we've done that, we'll refit the same workflow using all of our completed historical seasons.
+
+```{r}
+#| label: refit-final
+
+all_history <- bind_rows(train, test)
+
+final_fit <- finals_workflow %>%
+  fit(data = all_history)
+```
+
+<!-- Nothing about our workflow changed. We're simply giving it more historical data to learn from. -->
+
+
+## 9. Predict the 2026 playoffs
+
+Finally, we'll apply our fitted workflow to the 2026 season as it stands today.
+
+```{r}
+#| label: predict-2026
+
+current <- current %>%
+  filter(month == "2026-09-01") # select for the most recent week in the dataset
+
+current_predictions <- predict(
+  final_fit,
+  new_data = current,
+  type = "prob"
+) %>%
+  bind_cols(
+    predict(final_fit, new_data = current)
+  ) %>%
+  bind_cols(
+    current %>%
+      select(team)
+  ) %>%
+  arrange(desc(.pred_Yes))
+```
+
+> **A note on the numbers:** the RF playoff score shows how strongly the random forest leans toward a finals outcome.
+
+```{r}
+#| label: predict-2026-table
+
+current_predictions %>%
+  transmute(
+    Team = team,
+    `RF Final score` = scales::percent(.pred_Yes, accuracy = 1)
+  ) %>%
+  kable(align = "lr")
+```
+
+Nashville SC has the highest likelihood of reaching the finals at this point in the season, with a **60.9%** chance. Los Angeles FC lands at about **54.9%**. Messi's Inter Miami is much less likely this year compared to last to reach the final, with a **36.5%** chance, but never count the little magician out! Out of the teams I support, only the Chicago Fire seem to have much of a chance at **17.2%**, likely thanks to the acquisition of a Mr. Robert Lewandowski.
+
+```{r}
+#| label: fig-playoff-scores
+#| fig-cap: "Random forest MLS Cup Final for the 2026 MLS season. Model scores, not calibrated odds."
+#| fig-width: 8
+#| fig-height: 6
+
+fire_red      <- "#CF102D"  # primary
+fire_navy     <- "#0A2342"  # deep navy 
+fire_sky      <- "#99D6EA"  # chicago flag light blue highlight
+fire_star_red <- "#E4002B"  # chicago star red
+fire_black    <- "#0A0A0A"
+muted_bar     <- "#B8BEC2"
+
+finals_scores <- current_predictions %>%
+  transmute(
+    team,
+    finals_score = .pred_Yes,
+    is_fire = team == "Chicago Fire FC"
+  ) %>%
+  arrange(finals_score) %>%
+  mutate(team = factor(team, levels = team))
+
+ggplot(
+  finals_scores,
+  aes(x = finals_score, y = team, fill = is_fire, color = is_fire)
+) +
+  geom_col(width = 0.72, linewidth = 0.6) +
+  geom_vline(
+    xintercept = 0.5,
+    linetype = "dashed",
+    color = "#9CA3AF",
+    linewidth = 0.5
+  ) +
+  geom_text(
+    aes(label = scales::percent(finals_score, accuracy = 1)),
+    hjust = -0.15,
+    size = 3.6,
+    color = fire_black
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 1.08),
+    breaks = seq(0, 1, 0.25),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_manual(
+    values = c(
+      `TRUE`  = fire_red,   # highlight the Fire
+      `FALSE` = muted_bar
+    )
+  ) +
+  scale_color_manual(
+    values = c(
+      `TRUE`  = fire_navy,  # Fire outline
+      `FALSE` = muted_bar
+    )
+  ) +
+  labs(
+    title = "Likelihood of Reaching the MLS Cup Final",
+    subtitle = "Random forest playoff scores for the 2026 MLS season",
+    caption = "Model scores, not actual odds.",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", color = fire_black, size = 16),
+    plot.subtitle = element_text(color = fire_navy, margin = margin(b = 12)),
+    plot.caption = element_text(
+      color = "#6B7280",
+      hjust = 0,
+      margin = margin(t = 10),
+      face = "italic"
+    ),
+    axis.text.y = element_text(color = fire_black),
+    axis.text.x = element_text(color = "#6B7280"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(color = "#EAEAEA"),
+    plot.margin = margin(10, 20, 10, 10)
+  )
+```
+
+We just built a random forest model and predicted who will be the in MLS Cup Finals, with Nashville SC (bleh) being the clear choice. With the playoffs coming up, it should be interesting to see how this plays out...
+
